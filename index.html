@@ -233,7 +233,7 @@ const KEYS = [['sleep', '수면의 질', '못 잤어요', '푹 잤어요'], ['fa
 
 async function capi(req) {
   if (!API) throw new Error('NO_API');
-  if (req.op !== 'login') { if (!TOKEN) throw new Error('BAD_TOKEN'); req.token = TOKEN; }
+  if (req.op !== 'login') { const tk = req.token || TOKEN; if (!tk) throw new Error('BAD_TOKEN'); req.token = tk; }
   let r; const ac = typeof AbortController === 'function' ? new AbortController() : null, tm = ac ? setTimeout(() => ac.abort(), 25000) : 0;
   try {
     const res = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(req), redirect: 'follow', signal: ac ? ac.signal : undefined });
@@ -264,13 +264,13 @@ function applyView(r, first) {
 function cacheSave() { if (!S || !TOKEN) return; try { ls.set(CKEY, JSON.stringify(Object.assign({}, S, { logs: [...logs], part, session: null, _c: TOKEN.slice(-12) }))); } catch (e) { /* 무시 */ } }
 function cacheLoad() { try { const c = JSON.parse(ls.get(CKEY) || 'null'); return c && c._c === TOKEN.slice(-12) && c.today === kstToday() && Array.isArray(c.tasks) ? c : null; } catch (e) { return null; } }
 function resetState() { S = null; logs = new Set(); part = {}; weekStart = null; err = ''; dd = null; saved = null; pd = null; pSaved = null; sending = false; pSending = false; outAsk = false; rv = null; openHow.clear(); document.body.style.overflow = ''; }
-function endSession(msg) { TOKEN = ''; ls.del(SKEY); ls.del(CKEY); resetState(); lg.pw = ''; lg.busy = false; lg.msg = msg || ''; loading = false; render(); }
+function endSession(msg) { pushLeave(TOKEN); TOKEN = ''; ls.del(SKEY); ls.del(CKEY); resetState(); lg.pw = ''; lg.busy = false; lg.msg = msg || ''; loading = false; render(); }
 async function load(first) {
   try {
     const r = await capi({ op: 'view' });
     if (r.session) { TOKEN = cleanTok(r.session); ls.set(SKEY, TOKEN); }       // 로그인 기간이 길게 이어져요
     if (pending > 0 && !first) return;                                            // 저장 중에는 서버 값이 옛것일 수 있어요
-    applyView(r, first); cacheSave();
+    applyView(r, first); cacheSave(); pushSync();
   } catch (e) {
     if (e.message === 'BAD_TOKEN') { endSession(TOKEN.indexOf('s1.') === 0 ? '로그인이 끝났어요. 다시 로그인해 주세요.' : '이 링크는 더 쓸 수 없어요. 코치님께 회원번호와 비밀번호를 받아 로그인해 주세요.'); return; }
     err = ({ NO_SERVER: '인터넷 연결을 확인해 주세요.', NO_API: '앱 설정이 비어 있어요. 코치님께 알려 주세요.' })[e.message] || '불러오지 못했어요. 인터넷 연결을 확인하고 다시 눌러 주세요.';
@@ -533,6 +533,57 @@ function meCard() {
   return `<div class="card"><h2>내 정보</h2><p class="hint" style="margin:0 0 4px">${no ? '회원번호 <b>' + esc(no) + '</b> · ' : ''}${esc(S.name)}님으로 로그인되어 있어요.</p>
     ${outAsk ? `<p class="hint" style="margin:8px 0 0">로그아웃하면 다시 들어올 때 회원번호와 비밀번호가 필요해요.</p><div class="bt2"><button class="btn primary" data-out="yes" style="background:var(--danger);border-color:var(--danger)">로그아웃</button><button class="btn" data-out="no" style="margin-top:12px">취소</button></div>` : '<button class="btn" data-out="ask" style="width:100%;margin-top:10px">로그아웃</button>'}</div>`;
 }
+
+/* ── 알림(앱 푸시): 코치님이 오늘의 과제를 보내면 폰 알림으로 받아요 ── */
+const IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const PUSHST = { sup: ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window), on: false, known: false, busy: false, msg: '', synced: '' };
+function keyBytes(b64u) { const p = String(b64u || '').replace(/-/g, '+').replace(/_/g, '/'), raw = atob(p + '===='.slice(p.length % 4 || 4)), o = new Uint8Array(raw.length); for (let i = 0; i < raw.length; i++) o[i] = raw.charCodeAt(i); return o; }
+function keyIs(sub, b64u) { try { const a = new Uint8Array(sub.options.applicationServerKey), b = keyBytes(b64u); return a.length === b.length && a.every((v, i) => v === b[i]); } catch (e) { return true; } }
+async function pushSync() {
+  if (!PUSHST.sup || !S || !S.push || !S.push.on || TOKEN.indexOf('s1.') !== 0) return;
+  try {
+    const reg = await navigator.serviceWorker.ready; let sub = await reg.pushManager.getSubscription(), on = !!sub && Notification.permission === 'granted';
+    if (on && !keyIs(sub, S.push.key)) { await sub.unsubscribe(); on = false; }                     // 서버 키가 바뀌었으면 다시 켜야 해요
+    if (on && PUSHST.synced !== TOKEN) { await capi({ op: 'psub', endpoint: sub.endpoint }); PUSHST.synced = TOKEN; }   // 서버 등록 확인(같으면 아무것도 쓰지 않아요)
+    if (on !== PUSHST.on || !PUSHST.known) { PUSHST.on = on; PUSHST.known = true; render(); }
+  } catch (e) { if (!PUSHST.known) { PUSHST.known = true; render(); } }
+}
+async function pushEnable() {
+  if (PUSHST.busy || !PUSHST.sup || !S || !S.push) return;
+  PUSHST.busy = true; PUSHST.msg = ''; render();
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') PUSHST.msg = perm === 'denied' ? '알림이 막혀 있어요. 폰 설정에서 이 앱의 알림을 허용한 뒤 다시 눌러 주세요.' : '알림을 허용해야 받을 수 있어요.';
+    else {
+      const reg = await navigator.serviceWorker.ready; let sub = await reg.pushManager.getSubscription();
+      if (sub && !keyIs(sub, S.push.key)) { await sub.unsubscribe(); sub = null; }
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(S.push.key) });
+      await capi({ op: 'psub', endpoint: sub.endpoint }); PUSHST.synced = TOKEN; PUSHST.on = true; toast('알림을 켰어요');
+    }
+  } catch (e) { PUSHST.msg = e && e.message === 'BAD_TOKEN' ? '로그인이 끝났어요. 다시 로그인해 주세요.' : '알림을 켜지 못했어요. 인터넷 연결을 확인하고 다시 눌러 주세요.'; }
+  PUSHST.busy = false; render();
+}
+async function pushDisable() {
+  if (PUSHST.busy) return; PUSHST.busy = true; render();
+  try { const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription(); if (sub) { const ep = sub.endpoint; await sub.unsubscribe(); try { await capi({ op: 'punsub', endpoint: ep }); } catch (e) { /* 서버에서는 다음 발송 때 정리돼요 */ } } PUSHST.on = false; PUSHST.synced = ''; toast('알림을 껐어요'); }
+  catch (e) { PUSHST.msg = '알림을 끄지 못했어요. 다시 눌러 주세요.'; }
+  PUSHST.busy = false; render();
+}
+// 로그아웃·로그인 종료 때: 이 폰의 알림 등록을 지워요 (다른 사람이 같은 폰으로 로그인해도 알림이 섞이지 않게)
+async function pushLeave(tk) {
+  if (!PUSHST.sup) return;
+  try { const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription(); PUSHST.on = false; PUSHST.known = false; PUSHST.synced = ''; if (!sub) return; const ep = sub.endpoint; await sub.unsubscribe(); if (tk) capi({ op: 'punsub', endpoint: ep, token: tk }).catch(() => {}); } catch (e) { /* 무시 */ }
+}
+function pushCard() {
+  if (!S || !S.push || !S.push.on || TOKEN.indexOf('s1.') !== 0) return '';
+  const standalone = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+  let inner;
+  if (!PUSHST.sup) inner = IOS && !standalone ? '<p class="hint" style="margin:0">아이폰은 <b>홈 화면에 추가한 앱</b>에서만 알림을 켤 수 있어요. 홈 화면에 추가한 뒤, 그 아이콘으로 앱을 열어서 켜 주세요.</p>' : '<p class="hint" style="margin:0">이 브라우저에서는 알림을 쓸 수 없어요.</p>';
+  else if (!PUSHST.known) return '';
+  else if (PUSHST.on) inner = '<p class="hint" style="margin:0 0 10px">알림이 켜져 있어요. 코치님이 오늘의 과제를 보내면 알림으로 알려드려요.</p><button class="btn" data-push="off"' + (PUSHST.busy ? ' disabled' : '') + '>알림 끄기</button>';
+  else inner = '<p class="hint" style="margin:0 0 10px">코치님이 보내는 오늘의 과제를 폰 알림으로 받을 수 있어요.</p><button class="btn primary" data-push="on"' + (PUSHST.busy ? ' disabled' : '') + '>' + (PUSHST.busy ? '켜는 중…' : '알림 받기') + '</button>';
+  return '<div class="card"><h2>알림</h2>' + inner + (PUSHST.msg ? '<div class="err" role="alert" style="margin:10px 0 0">' + esc(PUSHST.msg) + '</div>' : '') + '</div>';
+}
 function render() {
   const app = $('app');
   if (!TOKEN) { app.innerHTML = loginView(); return; }
@@ -558,6 +609,7 @@ function render() {
   h += reportCard();
   h += dailyForm();
   h += painForm();
+  h += pushCard();
   h += meCard();
   app.innerHTML = h;
 }
@@ -571,6 +623,7 @@ document.addEventListener('click', e => {
   if (b.dataset.lgshow) { lg.show = !lg.show; render(); const p = $('lgPw'); if (p) { p.focus(); try { p.setSelectionRange(p.value.length, p.value.length); } catch (x) { /* 무시 */ } } return; }
   if (b.dataset.rep) { const r = ((S && S.reports) || []).find(x => x.id === b.dataset.rep); openReport(b.dataset.rep, r ? r.title : ''); return; }
   if (b.dataset.rvclose) { closeRv(); return; }
+  if (b.dataset.push) { if (b.dataset.push === 'on') pushEnable(); else pushDisable(); return; }
   if (b.dataset.out) { if (b.dataset.out === 'yes') doLogout(); else { outAsk = b.dataset.out === 'ask'; render(); } return; }
   if (b.dataset.s) { const v = +b.dataset.v; dd[b.dataset.s] = dd[b.dataset.s] === v ? null : v; render(); return; }
   if (b.dataset.itab) { instTab = b.dataset.itab; instOpen = true; render(); return; }
